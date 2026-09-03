@@ -1,0 +1,21 @@
+project_id = "kjememo-sync"
+
+[auth]
+site_url = "https://wjddms945-code.github.io/kjememo-page/"
+additional_redirect_urls = [
+  "https://wjddms945-code.github.io/kjememo-page/",
+  "http://localhost:3001/**",
+]
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = true
+secure_password_change = false
+max_frequency = "1m"
+otp_length = 8
+otp_expiry = 3600
+
+[auth.mfa.totp]
+enroll_enabled = true
+verify_enabled = true

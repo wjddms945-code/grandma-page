@@ -1,11 +1,13 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, Clipboard, Copy, MoreHorizontal, Plus, Sparkles } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Check, ChevronDown, ChevronRight, Clipboard, Cloud, CloudOff, Copy, LogOut, MoreHorizontal, Plus, RefreshCw, Sparkles } from 'lucide-react';
+import type { Session } from '@supabase/supabase-js';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { getSupabaseClient, isSupabaseConfigured } from '@/lib/supabase';
 
 type Project = { id: string; name: string; createdAt: string };
 type Memo = { id: string; projectId: string; content: string; createdAt: string; updatedAt: string };
@@ -14,6 +16,9 @@ type DailySummary = { id: string; projectId: string; date: string; rawText: stri
 type AppData = { projects: Project[]; memos: Memo[]; summaries: DailySummary[] };
 
 const STORAGE_KEY = 'quick-work-notes:v1';
+const SYNC_META_KEY = 'quick-work-notes:sync:v1';
+type SyncStatus = 'local' | 'connecting' | 'syncing' | 'synced' | 'offline' | 'error';
+type SyncMeta = { userId?: string; dirty: boolean; lastSyncedAt?: string };
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 const iso = (date: string, time: string) => `${date}T${time}:00+09:00`;
 const sampleSummary = `[현재 상황]
@@ -83,6 +88,30 @@ const formatTime = (value: string) => new Intl.DateTimeFormat('ko-KR', { hour: '
 const formatDateTitle = (date: string) => { const value = new Date(`${date}T12:00:00`); return `${value.getMonth() + 1}월 ${value.getDate()}일 (${new Intl.DateTimeFormat('ko-KR', { weekday: 'short' }).format(value).replace('요일', '')})`; };
 const shortDate = (date: string) => { const [, month, day] = date.split('-'); return `${Number(month)}/${Number(day)}`; };
 
+const readSyncMeta = (): SyncMeta => {
+  try { return JSON.parse(localStorage.getItem(SYNC_META_KEY) ?? '{"dirty":false}') as SyncMeta; }
+  catch { return { dirty: false }; }
+};
+const writeSyncMeta = (meta: SyncMeta) => localStorage.setItem(SYNC_META_KEY, JSON.stringify(meta));
+const validAppData = (value: unknown): value is AppData => {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<AppData>;
+  return Array.isArray(candidate.projects) && Array.isArray(candidate.memos) && Array.isArray(candidate.summaries);
+};
+const mergeById = <T extends { id: string }>(local: T[], remote: T[], updatedAt?: (item: T) => string) => {
+  const merged = new Map(local.map((item) => [item.id, item]));
+  remote.forEach((item) => {
+    const current = merged.get(item.id);
+    if (!current || !updatedAt || updatedAt(item) >= updatedAt(current)) merged.set(item.id, item);
+  });
+  return [...merged.values()];
+};
+const mergeAppData = (local: AppData, remote: AppData): AppData => ({
+  projects: mergeById(local.projects, remote.projects),
+  memos: mergeById(local.memos, remote.memos, (item) => item.updatedAt),
+  summaries: mergeById(local.summaries, remote.summaries, (item) => item.updatedAt),
+});
+
 export default function Home() {
   const [data, setData] = useState<AppData | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState('project-1');
@@ -101,16 +130,174 @@ export default function Home() {
   const [summaryText, setSummaryText] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<{ type: 'project' | 'memo' | 'summary'; id: string; label: string } | null>(null);
   const [toast, setToast] = useState('');
+  const [session, setSession] = useState<Session | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(isSupabaseConfigured ? 'connecting' : 'local');
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
+  const [email, setEmail] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authMessage, setAuthMessage] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const selectedProjectRef = useRef(selectedProjectId);
+  const dataRef = useRef<AppData | null>(null);
+  const sessionRef = useRef<Session | null>(null);
+  const hydratedRef = useRef(false);
+  const applyingRemoteRef = useRef(false);
+  const initialSyncUserRef = useRef<string | null>(null);
+  const syncingUserRef = useRef<string | null>(null);
+  const uploadTimerRef = useRef<number | null>(null);
+
+  const pushState = useCallback(async (payload: AppData, userId: string) => {
+    const client = getSupabaseClient();
+    if (!client || !navigator.onLine) { setSyncStatus('offline'); return; }
+    const snapshot = JSON.stringify(payload);
+    setSyncStatus('syncing');
+    const { data: saved, error } = await client
+      .from('app_states')
+      .upsert({ user_id: userId, payload }, { onConflict: 'user_id' })
+      .select('updated_at')
+      .single();
+    if (error) { setSyncStatus('error'); throw error; }
+    if (snapshot === JSON.stringify(dataRef.current)) {
+      writeSyncMeta({ userId, dirty: false, lastSyncedAt: saved.updated_at });
+      setSyncStatus('synced');
+    }
+  }, []);
+
+  const queueUpload = useCallback((payload: AppData, userId: string, delay = 800) => {
+    if (uploadTimerRef.current !== null) window.clearTimeout(uploadTimerRef.current);
+    if (!navigator.onLine) { setSyncStatus('offline'); return; }
+    setSyncStatus('syncing');
+    uploadTimerRef.current = window.setTimeout(() => {
+      uploadTimerRef.current = null;
+      void pushState(payload, userId).catch(() => undefined);
+    }, delay);
+  }, [pushState]);
 
   useEffect(() => {
     try { const saved = localStorage.getItem(STORAGE_KEY); const loaded = saved ? JSON.parse(saved) as AppData : initialData(); setData(loaded); setSelectedProjectId(loaded.projects[0]?.id ?? ''); }
     catch { setData(initialData()); }
   }, []);
-  useEffect(() => { if (data) localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }, [data]);
+  useEffect(() => {
+    if (!data) return;
+    dataRef.current = data;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    if (!hydratedRef.current) { hydratedRef.current = true; return; }
+    if (applyingRemoteRef.current) { applyingRemoteRef.current = false; return; }
+    const activeSession = sessionRef.current;
+    const previous = readSyncMeta();
+    writeSyncMeta({ ...previous, userId: activeSession?.user.id ?? previous.userId, dirty: true });
+    if (activeSession && initialSyncUserRef.current === activeSession.user.id) queueUpload(data, activeSession.user.id);
+  }, [data, queueUpload]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(''), 1800); return () => window.clearTimeout(timer); }, [toast]);
   useEffect(() => { selectedProjectRef.current = selectedProjectId; }, [selectedProjectId]);
+
+  useEffect(() => {
+    const client = getSupabaseClient();
+    if (!client) { setSyncStatus('local'); return; }
+    let active = true;
+    void client.auth.getSession().then(({ data: result }) => {
+      if (!active) return;
+      sessionRef.current = result.session;
+      setSession(result.session);
+      setSyncStatus(result.session ? 'syncing' : 'local');
+    });
+    const { data: listener } = client.auth.onAuthStateChange((_event, nextSession) => {
+      window.setTimeout(() => {
+        if (!active) return;
+        sessionRef.current = nextSession;
+        setSession(nextSession);
+        if (!nextSession) {
+          initialSyncUserRef.current = null;
+          syncingUserRef.current = null;
+          setSyncStatus('local');
+        }
+      }, 0);
+    });
+    return () => { active = false; listener.subscription.unsubscribe(); };
+  }, []);
+
+  useEffect(() => {
+    if (!session || !data || initialSyncUserRef.current === session.user.id || syncingUserRef.current === session.user.id) return;
+    const client = getSupabaseClient();
+    if (!client) return;
+    syncingUserRef.current = session.user.id;
+    setSyncStatus('syncing');
+    void (async () => {
+      const local = dataRef.current ?? data;
+      const meta = readSyncMeta();
+      const { data: remoteRow, error } = await client
+        .from('app_states')
+        .select('payload, updated_at')
+        .eq('user_id', session.user.id)
+        .maybeSingle();
+      if (error) throw error;
+
+      let next = local;
+      let shouldUpload = !remoteRow;
+      if (remoteRow && validAppData(remoteRow.payload)) {
+        if (meta.userId === session.user.id) {
+          if (meta.dirty) shouldUpload = true;
+          else next = remoteRow.payload;
+        } else if (JSON.stringify(local) === JSON.stringify(initialData())) next = remoteRow.payload;
+        else {
+          next = mergeAppData(local, remoteRow.payload);
+          shouldUpload = JSON.stringify(next) !== JSON.stringify(remoteRow.payload);
+        }
+      }
+
+      initialSyncUserRef.current = session.user.id;
+      if (JSON.stringify(next) !== JSON.stringify(dataRef.current)) {
+        dataRef.current = next;
+        applyingRemoteRef.current = true;
+        setData(next);
+        if (!next.projects.some((item) => item.id === selectedProjectRef.current)) setSelectedProjectId(next.projects[0]?.id ?? '');
+      }
+      if (shouldUpload) await pushState(next, session.user.id);
+      else {
+        writeSyncMeta({ userId: session.user.id, dirty: false, lastSyncedAt: remoteRow?.updated_at });
+        setSyncStatus('synced');
+      }
+    })().catch(() => setSyncStatus('error')).finally(() => { syncingUserRef.current = null; });
+  }, [data, pushState, session]);
+
+  useEffect(() => {
+    if (!session) return;
+    const client = getSupabaseClient();
+    if (!client) return;
+    const channel = client
+      .channel(`app-state:${session.user.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_states', filter: `user_id=eq.${session.user.id}` }, (event) => {
+        const row = event.new as { payload?: unknown; updated_at?: string };
+        if (!validAppData(row.payload)) return;
+        const meta = readSyncMeta();
+        if (meta.dirty || JSON.stringify(row.payload) === JSON.stringify(dataRef.current)) return;
+        dataRef.current = row.payload;
+        applyingRemoteRef.current = true;
+        setData(row.payload);
+        if (!row.payload.projects.some((item) => item.id === selectedProjectRef.current)) setSelectedProjectId(row.payload.projects[0]?.id ?? '');
+        writeSyncMeta({ userId: session.user.id, dirty: false, lastSyncedAt: row.updated_at });
+        setSyncStatus('synced');
+      })
+      .subscribe((status) => { if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setSyncStatus('error'); });
+    return () => { void client.removeChannel(channel); };
+  }, [session]);
+
+  useEffect(() => {
+    const online = () => {
+      const activeSession = sessionRef.current;
+      const current = dataRef.current;
+      if (activeSession && current) queueUpload(current, activeSession.user.id, 0);
+      else setSyncStatus('local');
+    };
+    const offline = () => setSyncStatus('offline');
+    window.addEventListener('online', online);
+    window.addEventListener('offline', offline);
+    return () => {
+      window.removeEventListener('online', online);
+      window.removeEventListener('offline', offline);
+      if (uploadTimerRef.current !== null) window.clearTimeout(uploadTimerRef.current);
+    };
+  }, [queueUpload]);
 
   useEffect(() => {
     const context = (document as Document & { modelContext?: { registerTool: (tool: unknown, options?: { signal?: AbortSignal }) => void | Promise<void> } }).modelContext;
@@ -181,6 +368,30 @@ export default function Home() {
 
 --- 업무 기록 ---
 ${rawCopy(date, memos)}`;
+  const syncLabel = !isSupabaseConfigured ? '동기화 설정 필요' : !session ? '동기화 연결' : syncStatus === 'synced' ? '동기화됨' : syncStatus === 'syncing' || syncStatus === 'connecting' ? '동기화 중' : syncStatus === 'offline' ? '오프라인 저장 중' : syncStatus === 'error' ? '동기화 확인 필요' : '이 기기에 저장됨';
+  const sendMagicLink = async () => {
+    const address = email.trim();
+    const client = getSupabaseClient();
+    if (!address || !client) return;
+    setAuthBusy(true);
+    setAuthMessage('');
+    const redirectTo = window.location.href.split(/[?#]/)[0];
+    const { error } = await client.auth.signInWithOtp({ email: address, options: { emailRedirectTo: redirectTo } });
+    setAuthBusy(false);
+    setAuthMessage(error ? `로그인 링크를 보내지 못했어요: ${error.message}` : '메일을 보냈어요. 같은 기기에서 로그인 링크를 눌러주세요.');
+  };
+  const signOut = async () => {
+    const client = getSupabaseClient();
+    if (!client) return;
+    await client.auth.signOut();
+    setSyncDialogOpen(false);
+    flash('로그아웃했어요. 기록은 이 기기에 남아 있어요.');
+  };
+  const syncNow = () => {
+    if (!session || !data) return;
+    queueUpload(data, session.user.id, 0);
+    flash('동기화를 시작했어요');
+  };
 
   return <main className="app-shell">
     <aside className="sidebar">
@@ -190,10 +401,11 @@ ${rawCopy(date, memos)}`;
         <button className="project-select" onClick={() => setSelectedProjectId(item.id)}><span>{item.name}</span><small>{count || ''}</small></button>
         <DropdownMenu><DropdownMenuTrigger className="icon-button project-more" aria-label={`${item.name} 메뉴`}><MoreHorizontal size={16} /></DropdownMenuTrigger><DropdownMenuContent align="end" className="menu-content"><DropdownMenuItem onClick={() => openProjectDialog(item)}>이름 수정</DropdownMenuItem><DropdownMenuItem variant="destructive" onClick={() => setDeleteTarget({ type: 'project', id: item.id, label: item.name })}>프로젝트 삭제</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
       </div>; })}</nav>
+      <button className={`sync-button ${session ? syncStatus : 'local'}`} onClick={() => setSyncDialogOpen(true)}>{syncStatus === 'syncing' || syncStatus === 'connecting' ? <RefreshCw size={15} className="spin" /> : syncStatus === 'offline' || syncStatus === 'error' || !isSupabaseConfigured ? <CloudOff size={15} /> : <Cloud size={15} />}<span>{syncLabel}</span></button>
     </aside>
 
     <section className="workspace">
-      <header className="mobile-header"><button className="mobile-project-button" onClick={() => setProjectPickerOpen(!projectPickerOpen)}>{project?.name ?? '프로젝트 선택'} <ChevronDown size={16} /></button><div className="mobile-header-actions"><button className="mobile-add" onClick={() => openProjectDialog()} aria-label="새 프로젝트"><Plus size={19} /></button>{project && <DropdownMenu><DropdownMenuTrigger className="mobile-more" aria-label="현재 프로젝트 메뉴"><MoreHorizontal size={19} /></DropdownMenuTrigger><DropdownMenuContent align="end" className="menu-content"><DropdownMenuItem onClick={() => openProjectDialog(project)}>이름 수정</DropdownMenuItem><DropdownMenuItem variant="destructive" onClick={() => setDeleteTarget({ type: 'project', id: project.id, label: project.name })}>프로젝트 삭제</DropdownMenuItem></DropdownMenuContent></DropdownMenu>}</div>
+      <header className="mobile-header"><button className="mobile-project-button" onClick={() => setProjectPickerOpen(!projectPickerOpen)}>{project?.name ?? '프로젝트 선택'} <ChevronDown size={16} /></button><div className="mobile-header-actions"><button className={`mobile-sync ${session ? syncStatus : 'local'}`} onClick={() => setSyncDialogOpen(true)} aria-label={syncLabel}>{syncStatus === 'syncing' || syncStatus === 'connecting' ? <RefreshCw size={18} className="spin" /> : syncStatus === 'offline' || syncStatus === 'error' || !isSupabaseConfigured ? <CloudOff size={18} /> : <Cloud size={18} />}</button><button className="mobile-add" onClick={() => openProjectDialog()} aria-label="새 프로젝트"><Plus size={19} /></button>{project && <DropdownMenu><DropdownMenuTrigger className="mobile-more" aria-label="현재 프로젝트 메뉴"><MoreHorizontal size={19} /></DropdownMenuTrigger><DropdownMenuContent align="end" className="menu-content"><DropdownMenuItem onClick={() => openProjectDialog(project)}>이름 수정</DropdownMenuItem><DropdownMenuItem variant="destructive" onClick={() => setDeleteTarget({ type: 'project', id: project.id, label: project.name })}>프로젝트 삭제</DropdownMenuItem></DropdownMenuContent></DropdownMenu>}</div>
         {projectPickerOpen && <div className="mobile-project-menu">{data.projects.map((item) => <button key={item.id} className={item.id === selectedProjectId ? 'active' : ''} onClick={() => { setSelectedProjectId(item.id); setProjectPickerOpen(false); }}>{item.name}<span>{data.memos.filter((memo) => memo.projectId === item.id).length || ''}</span></button>)}</div>}
       </header>
       <div className="content">
@@ -217,6 +429,9 @@ ${rawCopy(date, memos)}`;
       </div>
     </section>
 
+    <Dialog open={syncDialogOpen} onOpenChange={setSyncDialogOpen}><DialogContent className="app-dialog sync-dialog"><DialogHeader><DialogTitle>기기 간 동기화</DialogTitle><DialogDescription>기록은 이 기기의 localStorage에 먼저 저장되고, 로그인하면 Supabase에도 안전하게 복사됩니다.</DialogDescription></DialogHeader>
+      {!isSupabaseConfigured ? <div className="sync-info warning"><CloudOff size={18} /><div><strong>Supabase 연결 정보가 아직 없어요.</strong><p>프로젝트 URL과 공개용 키를 연결하면 동기화를 사용할 수 있어요.</p></div></div> : session ? <div className="sync-account"><div className="sync-info"><Cloud size={18} /><div><strong>{syncLabel}</strong><p>{session.user.email}</p></div></div><p className="sync-help">휴대폰과 PC에서 같은 이메일로 로그인하면 같은 업무 기록이 표시됩니다.</p><DialogFooter><button className="button-secondary signout-button" onClick={() => void signOut()}><LogOut size={14} /> 로그아웃</button><button className="button-primary sync-now-button" onClick={syncNow} disabled={syncStatus === 'syncing'}><RefreshCw size={14} /> 지금 동기화</button></DialogFooter></div> : <div className="sync-login"><label htmlFor="sync-email">로그인 이메일</label><input id="sync-email" className="dialog-input" type="email" inputMode="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void sendMagicLink()} placeholder="name@example.com" /><p>메일로 오는 로그인 링크를 누르면 비밀번호 없이 연결됩니다.</p>{authMessage && <div className="auth-message" role="status">{authMessage}</div>}<DialogFooter><button className="button-secondary" onClick={() => setSyncDialogOpen(false)}>나중에</button><button className="button-primary" onClick={() => void sendMagicLink()} disabled={!email.trim() || authBusy}>{authBusy ? '보내는 중…' : '로그인 링크 보내기'}</button></DialogFooter></div>}
+    </DialogContent></Dialog>
     <Dialog open={dialog === 'project'} onOpenChange={(open) => !open && setDialog(null)}><DialogContent className="app-dialog"><DialogHeader><DialogTitle>{editingProjectId ? '프로젝트 이름 수정' : '새 프로젝트'}</DialogTitle><DialogDescription>업무를 모아둘 프로젝트 이름을 입력하세요.</DialogDescription></DialogHeader><input className="dialog-input" autoFocus value={projectName} onChange={(e) => setProjectName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && saveProject()} placeholder="프로젝트 이름" /><DialogFooter><button className="button-secondary" onClick={() => setDialog(null)}>취소</button><button className="button-primary" onClick={saveProject} disabled={!projectName.trim()}>저장</button></DialogFooter></DialogContent></Dialog>
     <Dialog open={dialog === 'memo'} onOpenChange={(open) => !open && setDialog(null)}><DialogContent className="app-dialog wide"><DialogHeader><DialogTitle>기록 수정</DialogTitle><DialogDescription>원문을 수정합니다. 작성 시간은 유지돼요.</DialogDescription></DialogHeader><textarea className="dialog-textarea" value={memoText} onChange={(e) => setMemoText(e.target.value)} rows={8} /><DialogFooter><button className="button-secondary" onClick={() => setDialog(null)}>취소</button><button className="button-primary" onClick={saveEditedMemo} disabled={!memoText.trim()}>저장</button></DialogFooter></DialogContent></Dialog>
     <Dialog open={dialog === 'summary'} onOpenChange={(open) => !open && setDialog(null)}><DialogContent className="app-dialog summary-dialog"><DialogHeader><DialogTitle>{formatDateTitle(summaryDate || '2026-09-03')} AI 정리</DialogTitle><DialogDescription>ChatGPT에서 정리한 결과 전체를 그대로 붙여넣으세요. 원문 기록은 바뀌지 않아요.</DialogDescription></DialogHeader><textarea className="dialog-textarea summary-input" value={summaryText} onChange={(e) => setSummaryText(e.target.value)} placeholder={'[현재 상황]\n\n[결정 사항]\n- \n\n[진행 사항]\n- [x] \n\n[다음 할 일]\n- [ ] \n\n[메모]'} rows={18} /><DialogFooter><button className="button-secondary" onClick={() => setDialog(null)}>취소</button><button className="button-primary" onClick={saveSummary} disabled={!summaryText.trim()}>저장</button></DialogFooter></DialogContent></Dialog>
