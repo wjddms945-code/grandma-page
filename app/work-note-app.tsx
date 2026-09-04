@@ -136,6 +136,7 @@ export default function Home() {
   const [email, setEmail] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [authMessage, setAuthMessage] = useState('');
+  const [resendSeconds, setResendSeconds] = useState(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const selectedProjectRef = useRef(selectedProjectId);
   const dataRef = useRef<AppData | null>(null);
@@ -189,17 +190,60 @@ export default function Home() {
     if (activeSession && initialSyncUserRef.current === activeSession.user.id) queueUpload(data, activeSession.user.id);
   }, [data, queueUpload]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(''), 1800); return () => window.clearTimeout(timer); }, [toast]);
+  useEffect(() => {
+    if (resendSeconds <= 0) return;
+    const timer = window.setTimeout(() => setResendSeconds((value) => Math.max(0, value - 1)), 1000);
+    return () => window.clearTimeout(timer);
+  }, [resendSeconds]);
   useEffect(() => { selectedProjectRef.current = selectedProjectId; }, [selectedProjectId]);
 
   useEffect(() => {
     const client = getSupabaseClient();
     if (!client) { setSyncStatus('local'); return; }
     let active = true;
-    void client.auth.getSession().then(({ data: result }) => {
+    const finishSession = (nextSession: Session | null) => {
       if (!active) return;
-      sessionRef.current = result.session;
-      setSession(result.session);
-      setSyncStatus(result.session ? 'syncing' : 'local');
+      sessionRef.current = nextSession;
+      setSession(nextSession);
+      setSyncStatus(nextSession ? 'syncing' : 'local');
+    };
+    void (async () => {
+      const search = new URLSearchParams(window.location.search);
+      const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+      const callbackError = search.get('error_description') ?? hash.get('error_description');
+      const code = search.get('code');
+      const accessToken = hash.get('access_token');
+      const refreshToken = hash.get('refresh_token');
+      const hasCallback = Boolean(callbackError || code || accessToken || refreshToken);
+
+      if (callbackError) {
+        setAuthMessage(`로그인 링크를 확인하지 못했어요: ${callbackError}`);
+        setSyncDialogOpen(true);
+        finishSession(null);
+      } else {
+        const result = code
+          ? await client.auth.exchangeCodeForSession(code)
+          : accessToken && refreshToken
+            ? await client.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
+            : await client.auth.getSession();
+        if (result.error) {
+          setAuthMessage('로그인 링크가 만료됐거나 이미 사용됐어요. 새 링크를 한 번만 받아주세요.');
+          setSyncDialogOpen(true);
+          finishSession(null);
+        } else {
+          finishSession(result.data.session);
+          if (hasCallback && result.data.session) {
+            setAuthMessage('');
+            setSyncDialogOpen(false);
+            setToast('로그인됐어요. 기록을 동기화합니다.');
+          }
+        }
+      }
+      if (hasCallback) window.history.replaceState({}, document.title, window.location.pathname);
+    })().catch(() => {
+      setAuthMessage('로그인 정보를 저장하지 못했어요. 새 링크를 한 번만 받아주세요.');
+      setSyncDialogOpen(true);
+      finishSession(null);
     });
     const { data: listener } = client.auth.onAuthStateChange((_event, nextSession) => {
       window.setTimeout(() => {
@@ -376,9 +420,15 @@ ${rawCopy(date, memos)}`;
     setAuthBusy(true);
     setAuthMessage('');
     const redirectTo = window.location.href.split(/[?#]/)[0];
-    const { error } = await client.auth.signInWithOtp({ email: address, options: { emailRedirectTo: redirectTo } });
+    const { error } = await client.auth.signInWithOtp({ email: address, options: { emailRedirectTo: redirectTo, shouldCreateUser: false } });
     setAuthBusy(false);
-    setAuthMessage(error ? `로그인 링크를 보내지 못했어요: ${error.message}` : '메일을 보냈어요. 같은 기기에서 로그인 링크를 눌러주세요.');
+    if (error) {
+      const rateLimited = error.message.toLowerCase().includes('rate limit');
+      setAuthMessage(rateLimited ? '메일 발송 횟수를 초과했어요. 마지막 요청 후 1시간 뒤 한 번만 다시 눌러주세요.' : `로그인 링크를 보내지 못했어요: ${error.message}`);
+      return;
+    }
+    setResendSeconds(60);
+    setAuthMessage('메일을 보냈어요. 가장 최근 메일의 로그인 링크를 한 번만 눌러주세요.');
   };
   const signOut = async () => {
     const client = getSupabaseClient();
@@ -430,7 +480,7 @@ ${rawCopy(date, memos)}`;
     </section>
 
     <Dialog open={syncDialogOpen} onOpenChange={setSyncDialogOpen}><DialogContent className="app-dialog sync-dialog"><DialogHeader><DialogTitle>기기 간 동기화</DialogTitle><DialogDescription>기록은 이 기기의 localStorage에 먼저 저장되고, 로그인하면 Supabase에도 안전하게 복사됩니다.</DialogDescription></DialogHeader>
-      {!isSupabaseConfigured ? <div className="sync-info warning"><CloudOff size={18} /><div><strong>Supabase 연결 정보가 아직 없어요.</strong><p>프로젝트 URL과 공개용 키를 연결하면 동기화를 사용할 수 있어요.</p></div></div> : session ? <div className="sync-account"><div className="sync-info"><Cloud size={18} /><div><strong>{syncLabel}</strong><p>{session.user.email}</p></div></div><p className="sync-help">휴대폰과 PC에서 같은 이메일로 로그인하면 같은 업무 기록이 표시됩니다.</p><DialogFooter><button className="button-secondary signout-button" onClick={() => void signOut()}><LogOut size={14} /> 로그아웃</button><button className="button-primary sync-now-button" onClick={syncNow} disabled={syncStatus === 'syncing'}><RefreshCw size={14} /> 지금 동기화</button></DialogFooter></div> : <div className="sync-login"><label htmlFor="sync-email">로그인 이메일</label><input id="sync-email" className="dialog-input" type="email" inputMode="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void sendMagicLink()} placeholder="name@example.com" /><p>메일로 오는 로그인 링크를 누르면 비밀번호 없이 연결됩니다.</p>{authMessage && <div className="auth-message" role="status">{authMessage}</div>}<DialogFooter><button className="button-secondary" onClick={() => setSyncDialogOpen(false)}>나중에</button><button className="button-primary" onClick={() => void sendMagicLink()} disabled={!email.trim() || authBusy}>{authBusy ? '보내는 중…' : '로그인 링크 보내기'}</button></DialogFooter></div>}
+      {!isSupabaseConfigured ? <div className="sync-info warning"><CloudOff size={18} /><div><strong>Supabase 연결 정보가 아직 없어요.</strong><p>프로젝트 URL과 공개용 키를 연결하면 동기화를 사용할 수 있어요.</p></div></div> : session ? <div className="sync-account"><div className="sync-info"><Cloud size={18} /><div><strong>{syncLabel}</strong><p>{session.user.email}</p></div></div><p className="sync-help">휴대폰과 PC에서 같은 이메일로 로그인하면 같은 업무 기록이 표시됩니다.</p><DialogFooter><button className="button-secondary signout-button" onClick={() => void signOut()}><LogOut size={14} /> 로그아웃</button><button className="button-primary sync-now-button" onClick={syncNow} disabled={syncStatus === 'syncing'}><RefreshCw size={14} /> 지금 동기화</button></DialogFooter></div> : <div className="sync-login"><label htmlFor="sync-email">로그인 이메일</label><input id="sync-email" className="dialog-input" type="email" inputMode="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && resendSeconds === 0 && void sendMagicLink()} placeholder="name@example.com" /><p>가장 최근에 받은 메일의 로그인 링크를 한 번만 누르세요. 업무 노트로 돌아오면 자동으로 연결됩니다.</p>{authMessage && <output className="auth-message">{authMessage}</output>}<DialogFooter><button className="button-secondary" onClick={() => setSyncDialogOpen(false)}>나중에</button><button className="button-primary" onClick={() => void sendMagicLink()} disabled={!email.trim() || authBusy || resendSeconds > 0}>{authBusy ? '보내는 중…' : resendSeconds > 0 ? `${resendSeconds}초 후 다시 가능` : '로그인 링크 보내기'}</button></DialogFooter></div>}
     </DialogContent></Dialog>
     <Dialog open={dialog === 'project'} onOpenChange={(open) => !open && setDialog(null)}><DialogContent className="app-dialog"><DialogHeader><DialogTitle>{editingProjectId ? '프로젝트 이름 수정' : '새 프로젝트'}</DialogTitle><DialogDescription>업무를 모아둘 프로젝트 이름을 입력하세요.</DialogDescription></DialogHeader><input className="dialog-input" autoFocus value={projectName} onChange={(e) => setProjectName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && saveProject()} placeholder="프로젝트 이름" /><DialogFooter><button className="button-secondary" onClick={() => setDialog(null)}>취소</button><button className="button-primary" onClick={saveProject} disabled={!projectName.trim()}>저장</button></DialogFooter></DialogContent></Dialog>
     <Dialog open={dialog === 'memo'} onOpenChange={(open) => !open && setDialog(null)}><DialogContent className="app-dialog wide"><DialogHeader><DialogTitle>기록 수정</DialogTitle><DialogDescription>원문을 수정합니다. 작성 시간은 유지돼요.</DialogDescription></DialogHeader><textarea className="dialog-textarea" value={memoText} onChange={(e) => setMemoText(e.target.value)} rows={8} /><DialogFooter><button className="button-secondary" onClick={() => setDialog(null)}>취소</button><button className="button-primary" onClick={saveEditedMemo} disabled={!memoText.trim()}>저장</button></DialogFooter></DialogContent></Dialog>
