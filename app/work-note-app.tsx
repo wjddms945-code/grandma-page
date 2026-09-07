@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, Clipboard, Cloud, CloudOff, Copy, LogOut, MoreHorizontal, Plus, RefreshCw, Sparkles } from 'lucide-react';
+import { ArrowDownUp, Check, CheckCircle2, ChevronDown, ChevronRight, Clipboard, Cloud, CloudOff, Copy, FolderOpen, Home as HomeIcon, ListChecks, LogOut, MoreHorizontal, Plus, RefreshCw, Search, Sparkles } from 'lucide-react';
 import type { Session } from '@supabase/supabase-js';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -14,6 +14,8 @@ type Memo = { id: string; projectId: string; content: string; createdAt: string;
 type TodoItem = { id: string; text: string; completed: boolean };
 type DailySummary = { id: string; projectId: string; date: string; rawText: string; currentStatus: string; decisions: string[]; progress: TodoItem[]; nextActions: TodoItem[]; note: string; createdAt: string; updatedAt: string };
 type AppData = { projects: Project[]; memos: Memo[]; summaries: DailySummary[] };
+type AppView = 'home' | 'todos' | 'project';
+type TaskViewItem = TodoItem & { summaryId: string; projectId: string; projectName: string; date: string };
 
 const STORAGE_KEY = 'quick-work-notes:v1';
 const SYNC_META_KEY = 'quick-work-notes:sync:v1';
@@ -59,6 +61,24 @@ function parseSummary(rawText: string, previous?: DailySummary) {
     return { id: old?.id ?? uid(), text: itemText, completed: old?.completed ?? (checked ? checked[1].toLowerCase() === 'x' : defaultCompleted) };
   });
   return { currentStatus: text(sections.currentStatus), decisions: list(sections.decisions), progress: todos(sections.progress, true), nextActions: todos(sections.nextActions, false), note: text(sections.note) };
+}
+
+function updateTodoInRawText(rawText: string, targetText: string, completed: boolean) {
+  const aliases: Record<string, string> = { '현재 상황': 'currentStatus', 현재상황: 'currentStatus', '결정 사항': 'decisions', 결정사항: 'decisions', '진행 사항': 'progress', 진행사항: 'progress', '다음 할 일': 'nextActions', 다음할일: 'nextActions', 메모: 'note' };
+  let current: string | null = null;
+  let changed = false;
+  return rawText.replace(/\r\n/g, '\n').split('\n').map((line) => {
+    const heading = line.trim().match(/^\[\s*([^\]]+?)\s*\]\s*$/);
+    if (heading) {
+      current = aliases[heading[1].replace(/\s+/g, ' ').trim()] ?? null;
+      return line;
+    }
+    if (changed || current !== 'nextActions') return line;
+    const item = line.match(/^(\s*[-*•]?\s*)\[([xX ])\](\s*)(.*)$/);
+    if (!item || item[4].trim() !== targetText) return line;
+    changed = true;
+    return `${item[1]}[${completed ? 'x' : ' '}]${item[3]}${item[4]}`;
+  }).join('\n');
 }
 
 const initialData = (): AppData => {
@@ -114,12 +134,18 @@ const mergeAppData = (local: AppData, remote: AppData): AppData => ({
 
 export default function Home() {
   const [data, setData] = useState<AppData | null>(null);
+  const [appView, setAppView] = useState<AppView>('home');
   const [selectedProjectId, setSelectedProjectId] = useState('project-1');
   const [draft, setDraft] = useState('');
   const [openDates, setOpenDates] = useState<Set<string>>(new Set(['2026-09-03']));
   const [openSummaries, setOpenSummaries] = useState<Set<string>>(new Set(['2026-09-03']));
   const [expandedMemos, setExpandedMemos] = useState<Set<string>>(new Set());
   const [showTodos, setShowTodos] = useState(false);
+  const [todoScope, setTodoScope] = useState<'all' | 'today'>('all');
+  const [todoSort, setTodoSort] = useState<'recent' | 'oldest'>('recent');
+  const [todoSearch, setTodoSearch] = useState('');
+  const [todoProjectFilter, setTodoProjectFilter] = useState<string | null>(null);
+  const [collapsedTodoProjects, setCollapsedTodoProjects] = useState<Set<string>>(new Set());
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [dialog, setDialog] = useState<'project' | 'memo' | 'summary' | null>(null);
   const [projectName, setProjectName] = useState('');
@@ -371,27 +397,59 @@ export default function Home() {
   const project = data?.projects.find((item) => item.id === selectedProjectId);
   const projectMemos = useMemo(() => (data?.memos ?? []).filter((memo) => memo.projectId === selectedProjectId), [data, selectedProjectId]);
   const grouped = useMemo(() => { const map = new Map<string, Memo[]>(); projectMemos.forEach((memo) => { const key = dateKey(memo.createdAt); map.set(key, [...(map.get(key) ?? []), memo]); }); return [...map.entries()].sort(([a], [b]) => b.localeCompare(a)).map(([date, memos]) => ({ date, memos: memos.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()) })); }, [projectMemos]);
-  const selectedSummariesByDate = useMemo(() => {
+  const latestSummaries = useMemo(() => {
     const summaries = new Map<string, DailySummary>();
-    (data?.summaries ?? []).filter((summary) => summary.projectId === selectedProjectId).forEach((summary) => {
-      const current = summaries.get(summary.date);
-      if (!current || summary.updatedAt >= current.updatedAt) summaries.set(summary.date, summary);
+    (data?.summaries ?? []).forEach((summary) => {
+      const key = `${summary.projectId}:${summary.date}`;
+      const current = summaries.get(key);
+      if (!current || summary.updatedAt >= current.updatedAt) summaries.set(key, summary);
     });
-    return summaries;
-  }, [data, selectedProjectId]);
-  const unresolved = useMemo(() => [...selectedSummariesByDate.values()].flatMap((summary) => summary.nextActions.filter((item) => !item.completed).map((item) => ({ ...item, summaryId: summary.id, date: summary.date }))).sort((a, b) => b.date.localeCompare(a.date)), [selectedSummariesByDate]);
+    return [...summaries.values()];
+  }, [data]);
+  const selectedSummariesByDate = useMemo(() => new Map(latestSummaries.filter((summary) => summary.projectId === selectedProjectId).map((summary) => [summary.date, summary])), [latestSummaries, selectedProjectId]);
+  const allTasks = useMemo<TaskViewItem[]>(() => latestSummaries.flatMap((summary) => {
+    const projectName = data?.projects.find((item) => item.id === summary.projectId)?.name ?? '삭제된 프로젝트';
+    return summary.nextActions.map((item) => ({ ...item, summaryId: summary.id, projectId: summary.projectId, projectName, date: summary.date }));
+  }), [data, latestSummaries]);
+  const incompleteTasks = useMemo(() => allTasks.filter((item) => !item.completed), [allTasks]);
+  const completedTasks = useMemo(() => allTasks.filter((item) => item.completed), [allTasks]);
+  const today = dateKey(new Date().toISOString());
+  const todayTasks = useMemo(() => incompleteTasks.filter((item) => item.date === today), [incompleteTasks, today]);
+  const projectTodoCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    incompleteTasks.forEach((item) => counts.set(item.projectId, (counts.get(item.projectId) ?? 0) + 1));
+    return counts;
+  }, [incompleteTasks]);
+  const unresolved = useMemo(() => incompleteTasks.filter((item) => item.projectId === selectedProjectId).sort((a, b) => b.date.localeCompare(a.date)), [incompleteTasks, selectedProjectId]);
+  const visibleGlobalTasks = useMemo(() => {
+    const query = todoSearch.trim().toLocaleLowerCase('ko-KR');
+    return incompleteTasks
+      .filter((item) => !todoProjectFilter || item.projectId === todoProjectFilter)
+      .filter((item) => todoScope === 'all' || item.date === today)
+      .filter((item) => !query || item.text.toLocaleLowerCase('ko-KR').includes(query) || item.projectName.toLocaleLowerCase('ko-KR').includes(query))
+      .sort((a, b) => todoSort === 'recent' ? b.date.localeCompare(a.date) : a.date.localeCompare(b.date));
+  }, [incompleteTasks, todoProjectFilter, todoScope, todoSearch, todoSort, today]);
+  const globalTodoGroups = useMemo(() => (data?.projects ?? []).map((item) => ({ project: item, tasks: visibleGlobalTasks.filter((task) => task.projectId === item.id) })).filter((group) => group.tasks.length > 0), [data, visibleGlobalTasks]);
   if (!data) return <main className="loading">업무 노트를 여는 중…</main>;
 
   const updateData = (updater: (current: AppData) => AppData) => setData((current) => current ? updater(current) : current);
   const flash = (message: string) => setToast(message);
   const saveMemo = () => { const content = draft; if (!content.trim() || !selectedProjectId) return; const now = new Date().toISOString(); updateData((current) => ({ ...current, memos: [...current.memos, { id: uid(), projectId: selectedProjectId, content, createdAt: now, updatedAt: now }] })); setDraft(''); setOpenDates((current) => new Set(current).add(dateKey(now))); requestAnimationFrame(() => inputRef.current?.focus()); flash('기록했어요'); };
   const openProjectDialog = (item?: Project) => { setEditingProjectId(item?.id ?? null); setProjectName(item?.name ?? ''); setDialog('project'); };
-  const saveProject = () => { const name = projectName.trim(); if (!name) return; if (editingProjectId) updateData((current) => ({ ...current, projects: current.projects.map((item) => item.id === editingProjectId ? { ...item, name } : item) })); else { const id = uid(); updateData((current) => ({ ...current, projects: [...current.projects, { id, name, createdAt: new Date().toISOString() }] })); setSelectedProjectId(id); } setDialog(null); };
+  const saveProject = () => { const name = projectName.trim(); if (!name) return; if (editingProjectId) updateData((current) => ({ ...current, projects: current.projects.map((item) => item.id === editingProjectId ? { ...item, name } : item) })); else { const id = uid(); updateData((current) => ({ ...current, projects: [...current.projects, { id, name, createdAt: new Date().toISOString() }] })); setSelectedProjectId(id); setAppView('project'); } setDialog(null); };
   const openMemoDialog = (memo: Memo) => { setEditingMemoId(memo.id); setMemoText(memo.content); setDialog('memo'); };
   const saveEditedMemo = () => { if (!editingMemoId || !memoText.trim()) return; updateData((current) => ({ ...current, memos: current.memos.map((memo) => memo.id === editingMemoId ? { ...memo, content: memoText, updatedAt: new Date().toISOString() } : memo) })); setDialog(null); flash('수정했어요'); };
   const openSummaryDialog = (date: string) => { const summary = selectedSummariesByDate.get(date); setSummaryDate(date); setSummaryText(summary?.rawText ?? ''); setDialog('summary'); };
   const saveSummary = () => { const rawText = summaryText.trim(); if (!rawText) return; const previous = selectedSummariesByDate.get(summaryDate); const now = new Date().toISOString(); const next: DailySummary = { id: previous?.id ?? uid(), projectId: selectedProjectId, date: summaryDate, rawText, ...parseSummary(rawText, previous), createdAt: previous?.createdAt ?? now, updatedAt: now }; updateData((current) => ({ ...current, summaries: [...current.summaries.filter((item) => item.projectId !== selectedProjectId || item.date !== summaryDate), next] })); setOpenSummaries((current) => new Set(current).add(summaryDate)); setDialog(null); flash('AI 정리를 저장했어요'); };
-  const setTodoCompleted = (summaryId: string, todoId: string, completed: boolean) => updateData((current) => ({ ...current, summaries: current.summaries.map((summary) => summary.id !== summaryId ? summary : { ...summary, nextActions: summary.nextActions.map((item) => item.id === todoId ? { ...item, completed } : item), updatedAt: new Date().toISOString() }) }));
+  const setTodoCompleted = (summaryId: string, todoId: string, completed: boolean) => updateData((current) => ({ ...current, summaries: current.summaries.map((summary) => {
+    if (summary.id !== summaryId) return summary;
+    const todo = summary.nextActions.find((item) => item.id === todoId);
+    if (!todo) return summary;
+    return { ...summary, rawText: updateTodoInRawText(summary.rawText, todo.text, completed), nextActions: summary.nextActions.map((item) => item.id === todoId ? { ...item, completed } : item), updatedAt: new Date().toISOString() };
+  }) }));
+  const openProjectView = (projectId: string) => { setSelectedProjectId(projectId); setAppView('project'); setProjectPickerOpen(false); };
+  const openTodosView = (projectId?: string) => { setTodoProjectFilter(projectId ?? null); setTodoScope('all'); setTodoSearch(''); setAppView('todos'); setProjectPickerOpen(false); };
+  const openTodayTodos = () => { setTodoProjectFilter(null); setTodoScope('today'); setTodoSearch(''); setAppView('todos'); setProjectPickerOpen(false); };
   const confirmDelete = () => { if (!deleteTarget) return; if (deleteTarget.type === 'memo') updateData((current) => ({ ...current, memos: current.memos.filter((item) => item.id !== deleteTarget.id) })); else if (deleteTarget.type === 'summary') updateData((current) => ({ ...current, summaries: current.summaries.filter((item) => item.id !== deleteTarget.id) })); else { const remaining = data.projects.filter((item) => item.id !== deleteTarget.id); updateData((current) => ({ projects: remaining, memos: current.memos.filter((item) => item.projectId !== deleteTarget.id), summaries: current.summaries.filter((item) => item.projectId !== deleteTarget.id) })); if (selectedProjectId === deleteTarget.id) setSelectedProjectId(remaining[0]?.id ?? ''); } setDeleteTarget(null); flash('삭제했어요'); };
   const copyText = async (text: string, message: string) => { try { await navigator.clipboard.writeText(text); flash(message); } catch { flash('복사하지 못했어요'); } };
   const rawCopy = (date: string, memos: Memo[]) => { const ordered = [...memos].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()); return `[${project?.name ?? ''}]\n${date} 업무 기록\n\n${ordered.map((memo) => `${formatTime(memo.createdAt)}\n${memo.content}`).join('\n\n')}`; };
@@ -465,29 +523,37 @@ ${rawCopy(date, memos)}`;
     queueUpload(data, session.user.id, 0);
     flash('동기화를 시작했어요');
   };
+  const mobileTitle = appView === 'home' ? '홈' : appView === 'todos' ? '미완료 업무' : project?.name ?? '프로젝트 선택';
 
   return <main className="app-shell">
     <aside className="sidebar">
       <div className="brand-row"><span className="brand-mark" /><strong>업무 노트</strong></div>
       <button className="new-project" onClick={() => openProjectDialog()}><Plus size={16} /> 새 프로젝트</button>
-      <nav className="project-list" aria-label="프로젝트 목록">{data.projects.map((item) => { const count = data.memos.filter((memo) => memo.projectId === item.id).length; return <div key={item.id} className={`project-row ${item.id === selectedProjectId ? 'selected' : ''}`}>
-        <button className="project-select" onClick={() => setSelectedProjectId(item.id)}><span>{item.name}</span><small>{count || ''}</small></button>
+      <nav className="global-nav" aria-label="업무 전체 메뉴">
+        <button className={appView === 'home' ? 'active' : ''} onClick={() => setAppView('home')}><HomeIcon size={17} /><span>홈</span></button>
+        <button className={appView === 'todos' && !todoProjectFilter ? 'active' : ''} onClick={() => openTodosView()}><ListChecks size={17} /><span>미완료 업무</span><b>{incompleteTasks.length}</b></button>
+      </nav>
+      <div className="sidebar-section-title">프로젝트</div>
+      <nav className="project-list" aria-label="프로젝트 목록">{data.projects.map((item) => { const count = projectTodoCounts.get(item.id) ?? 0; return <div key={item.id} className={`project-row ${appView === 'project' && item.id === selectedProjectId ? 'selected' : ''}`}>
+        <button className="project-select" onClick={() => openProjectView(item.id)}><span>{item.name}</span><small>{count || ''}</small></button>
         <DropdownMenu><DropdownMenuTrigger className="icon-button project-more" aria-label={`${item.name} 메뉴`}><MoreHorizontal size={16} /></DropdownMenuTrigger><DropdownMenuContent align="end" className="menu-content"><DropdownMenuItem onClick={() => openProjectDialog(item)}>이름 수정</DropdownMenuItem><DropdownMenuItem variant="destructive" onClick={() => setDeleteTarget({ type: 'project', id: item.id, label: item.name })}>프로젝트 삭제</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
       </div>; })}</nav>
       <button className={`sync-button ${session ? syncStatus : 'local'}`} onClick={() => setSyncDialogOpen(true)}>{syncStatus === 'syncing' || syncStatus === 'connecting' ? <RefreshCw size={15} className="spin" /> : syncStatus === 'offline' || syncStatus === 'error' || !isSupabaseConfigured ? <CloudOff size={15} /> : <Cloud size={15} />}<span>{syncLabel}</span></button>
     </aside>
 
     <section className="workspace">
-      <header className="mobile-header"><button className="mobile-project-button" onClick={() => setProjectPickerOpen(!projectPickerOpen)}>{project?.name ?? '프로젝트 선택'} <ChevronDown size={16} /></button><div className="mobile-header-actions"><button className={`mobile-sync ${session ? syncStatus : 'local'}`} onClick={() => setSyncDialogOpen(true)} aria-label={syncLabel}>{syncStatus === 'syncing' || syncStatus === 'connecting' ? <RefreshCw size={18} className="spin" /> : syncStatus === 'offline' || syncStatus === 'error' || !isSupabaseConfigured ? <CloudOff size={18} /> : <Cloud size={18} />}</button><button className="mobile-add" onClick={() => openProjectDialog()} aria-label="새 프로젝트"><Plus size={19} /></button>{project && <DropdownMenu><DropdownMenuTrigger className="mobile-more" aria-label="현재 프로젝트 메뉴"><MoreHorizontal size={19} /></DropdownMenuTrigger><DropdownMenuContent align="end" className="menu-content"><DropdownMenuItem onClick={() => openProjectDialog(project)}>이름 수정</DropdownMenuItem><DropdownMenuItem variant="destructive" onClick={() => setDeleteTarget({ type: 'project', id: project.id, label: project.name })}>프로젝트 삭제</DropdownMenuItem></DropdownMenuContent></DropdownMenu>}</div>
-        {projectPickerOpen && <div className="mobile-project-menu">{data.projects.map((item) => <button key={item.id} className={item.id === selectedProjectId ? 'active' : ''} onClick={() => { setSelectedProjectId(item.id); setProjectPickerOpen(false); }}>{item.name}<span>{data.memos.filter((memo) => memo.projectId === item.id).length || ''}</span></button>)}</div>}
+      <header className="mobile-header"><button className="mobile-project-button" onClick={() => setProjectPickerOpen(!projectPickerOpen)}>{mobileTitle} <ChevronDown size={16} /></button><div className="mobile-header-actions"><button className={`mobile-sync ${session ? syncStatus : 'local'}`} onClick={() => setSyncDialogOpen(true)} aria-label={syncLabel}>{syncStatus === 'syncing' || syncStatus === 'connecting' ? <RefreshCw size={18} className="spin" /> : syncStatus === 'offline' || syncStatus === 'error' || !isSupabaseConfigured ? <CloudOff size={18} /> : <Cloud size={18} />}</button><button className="mobile-add" onClick={() => openProjectDialog()} aria-label="새 프로젝트"><Plus size={19} /></button>{appView === 'project' && project && <DropdownMenu><DropdownMenuTrigger className="mobile-more" aria-label="현재 프로젝트 메뉴"><MoreHorizontal size={19} /></DropdownMenuTrigger><DropdownMenuContent align="end" className="menu-content"><DropdownMenuItem onClick={() => openProjectDialog(project)}>이름 수정</DropdownMenuItem><DropdownMenuItem variant="destructive" onClick={() => setDeleteTarget({ type: 'project', id: project.id, label: project.name })}>프로젝트 삭제</DropdownMenuItem></DropdownMenuContent></DropdownMenu>}</div>
+        {projectPickerOpen && <div className="mobile-project-menu"><button className={appView === 'home' ? 'active' : ''} onClick={() => { setAppView('home'); setProjectPickerOpen(false); }}><span className="mobile-menu-label"><HomeIcon size={16} /> 홈</span></button><button className={appView === 'todos' && !todoProjectFilter ? 'active' : ''} onClick={() => openTodosView()}><span className="mobile-menu-label"><ListChecks size={16} /> 미완료 업무</span><span>{incompleteTasks.length || ''}</span></button><div className="mobile-menu-divider">프로젝트</div>{data.projects.map((item) => <button key={item.id} className={appView === 'project' && item.id === selectedProjectId ? 'active' : ''} onClick={() => openProjectView(item.id)}>{item.name}<span>{projectTodoCounts.get(item.id) || ''}</span></button>)}</div>}
       </header>
       <div className="content">
-        <div className="desktop-title"><h1>{project?.name ?? '프로젝트를 만들어주세요'}</h1><p>떠오르는 내용을 그대로 남겨두세요.</p></div>
-        {project && <div className="quick-entry"><textarea ref={inputRef} value={draft} rows={3} placeholder="메모하거나 대화를 그대로 붙여넣으세요" onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); saveMemo(); } }} aria-label="빠른 업무 기록" /><div className="entry-footer"><span>Enter로 기록 · Shift + Enter로 줄바꿈</span><button onClick={saveMemo} disabled={!draft.trim()}>기록</button></div></div>}
+        {appView === 'home' && <HomeDashboard projects={data.projects} incompleteTasks={incompleteTasks} completedCount={completedTasks.length} todayCount={todayTasks.length} projectTodoCounts={projectTodoCounts} onOpenTodos={openTodosView} onOpenToday={openTodayTodos} onToggle={setTodoCompleted} />}
+        {appView === 'todos' && <GlobalTodoView total={incompleteTasks.length} groups={globalTodoGroups} visibleCount={visibleGlobalTasks.length} projectFilterName={todoProjectFilter ? data.projects.find((item) => item.id === todoProjectFilter)?.name : undefined} scope={todoScope} sort={todoSort} search={todoSearch} collapsedProjects={collapsedTodoProjects} onScopeChange={setTodoScope} onSortChange={() => setTodoSort((current) => current === 'recent' ? 'oldest' : 'recent')} onSearchChange={setTodoSearch} onClearProjectFilter={() => setTodoProjectFilter(null)} onToggleProject={(projectId) => setCollapsedTodoProjects((current) => { const next = new Set(current); if (next.has(projectId)) next.delete(projectId); else next.add(projectId); return next; })} onToggle={setTodoCompleted} />}
+        {appView === 'project' && <><div className="desktop-title"><h1>{project?.name ?? '프로젝트를 만들어주세요'}</h1><p>떠오르는 내용을 그대로 남겨두세요.</p></div>
+          {project && <div className="quick-entry"><textarea ref={inputRef} value={draft} rows={3} placeholder="메모하거나 대화를 그대로 붙여넣으세요" onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); saveMemo(); } }} aria-label="빠른 업무 기록" /><div className="entry-footer"><span>Enter로 기록 · Shift + Enter로 줄바꿈</span><button onClick={saveMemo} disabled={!draft.trim()}>기록</button></div></div>}
 
-        {unresolved.length > 0 && <section className={`todo-overview ${showTodos ? 'open' : ''}`}><button className="todo-overview-heading" onClick={() => setShowTodos(!showTodos)}><span><ChevronRight size={16} /> 미완료 업무 <b>{unresolved.length}</b></span><small>{showTodos ? '접기' : '펼치기'}</small></button>{showTodos && <div className="todo-overview-list">{unresolved.map((todo) => <label key={`${todo.summaryId}:${todo.id}`} className="todo-row"><Checkbox checked={todo.completed} onCheckedChange={(checked) => setTodoCompleted(todo.summaryId, todo.id, checked === true)} /><span>{todo.text}</span><time>{shortDate(todo.date)}</time></label>)}</div>}</section>}
+          {unresolved.length > 0 && <section className={`todo-overview ${showTodos ? 'open' : ''}`}><button className="todo-overview-heading" onClick={() => setShowTodos(!showTodos)}><span><ChevronRight size={16} /> 미완료 업무 <b>{unresolved.length}</b></span><small>{showTodos ? '접기' : '펼치기'}</small></button>{showTodos && <div className="todo-overview-list">{unresolved.map((todo) => <label key={`${todo.summaryId}:${todo.id}`} className="todo-row"><Checkbox checked={todo.completed} onCheckedChange={(checked) => setTodoCompleted(todo.summaryId, todo.id, checked === true)} /><span>{todo.text}</span><time>{shortDate(todo.date)}</time></label>)}</div>}</section>}
 
-        <div className="date-list">{grouped.map(({ date, memos }, index) => { const isOpen = openDates.has(date) || (index === 0 && openDates.size === 0); const summary = selectedSummariesByDate.get(date); const summaryOpen = openSummaries.has(date); return <section className="date-group" key={date}>
+          <div className="date-list">{grouped.map(({ date, memos }, index) => { const isOpen = openDates.has(date) || (index === 0 && openDates.size === 0); const summary = selectedSummariesByDate.get(date); const summaryOpen = openSummaries.has(date); return <section className="date-group" key={date}>
           <div className="date-heading"><button className="date-toggle" onClick={() => setOpenDates((current) => { const next = new Set(current); next.has(date) ? next.delete(date) : next.add(date); return next; })}>{isOpen ? <ChevronDown size={17} /> : <ChevronRight size={17} />}<span>{formatDateTitle(date)}</span><small>· {memos.length}개 기록</small></button><div className="date-actions"><button onClick={() => copyText(rawCopy(date, memos), '날짜 기록을 복사했어요')}><Copy size={14} /><span>복사</span></button><button onClick={() => copyText(gptCopy(date, memos), 'GPT용 기록을 복사했어요')}><Clipboard size={14} /><span>GPT용</span></button><button className={summary ? 'summary-ready' : ''} onClick={() => summary ? setOpenSummaries((current) => { const next = new Set(current); next.has(date) ? next.delete(date) : next.add(date); return next; }) : openSummaryDialog(date)}><Sparkles size={14} /> AI 정리</button></div></div>
           {summary && summaryOpen && <div className="summary-panel"><div className="summary-panel-top"><strong>AI 정리</strong><div><button onClick={() => openSummaryDialog(date)}>편집</button><button onClick={() => setDeleteTarget({ type: 'summary', id: summary.id, label: `${formatDateTitle(date)} AI 정리` })}>삭제</button></div></div>
             {summary.currentStatus && <SummarySection title="현재 상황"><p>{summary.currentStatus}</p></SummarySection>}
@@ -498,9 +564,11 @@ ${rawCopy(date, memos)}`;
             {!summary.currentStatus && !summary.decisions.length && !summary.progress.length && !summary.nextActions.length && !summary.note && <div className="unparsed"><p>형식을 나누어 읽지 못해 원문을 그대로 보여드려요.</p><pre>{summary.rawText}</pre></div>}
           </div>}
           {isOpen && <div className="memo-list">{memos.map((memo) => { const long = memo.content.length > 180 || memo.content.split('\n').length > 4; const expanded = expandedMemos.has(memo.id); return <article className="memo" key={memo.id}><time>{formatTime(memo.createdAt)}</time><div className="memo-body"><div className={`memo-text ${long && !expanded ? 'clamped' : ''}`}>{memo.content}</div>{long && <button className="expand-button" onClick={() => setExpandedMemos((current) => { const next = new Set(current); next.has(memo.id) ? next.delete(memo.id) : next.add(memo.id); return next; })}>{expanded ? '접기' : '전체 보기'}</button>}</div><DropdownMenu><DropdownMenuTrigger className="icon-button memo-more" aria-label="기록 메뉴"><MoreHorizontal size={17} /></DropdownMenuTrigger><DropdownMenuContent align="end" className="menu-content"><DropdownMenuItem onClick={() => openMemoDialog(memo)}>수정</DropdownMenuItem><DropdownMenuItem variant="destructive" onClick={() => setDeleteTarget({ type: 'memo', id: memo.id, label: '이 기록' })}>삭제</DropdownMenuItem></DropdownMenuContent></DropdownMenu></article>; })}</div>}
-        </section>; })}{project && grouped.length === 0 && <div className="empty-state"><p>아직 기록이 없어요.</p><span>위 입력창에 첫 업무를 남겨보세요.</span></div>}</div>
+          </section>; })}{project && grouped.length === 0 && <div className="empty-state"><p>아직 기록이 없어요.</p><span>위 입력창에 첫 업무를 남겨보세요.</span></div>}</div></>}
       </div>
     </section>
+
+    <nav className="mobile-bottom-nav" aria-label="주요 메뉴"><button className={appView === 'home' ? 'active' : ''} onClick={() => setAppView('home')}><HomeIcon size={20} /><span>홈</span></button><button className={appView === 'todos' ? 'active' : ''} onClick={() => openTodosView()}><span className="mobile-nav-icon"><ListChecks size={20} />{incompleteTasks.length > 0 && <b>{incompleteTasks.length}</b>}</span><span>미완료</span></button><button className={appView === 'project' ? 'active' : ''} onClick={() => project && openProjectView(project.id)}><FolderOpen size={20} /><span>프로젝트</span></button></nav>
 
     <Dialog open={syncDialogOpen} onOpenChange={setSyncDialogOpen}><DialogContent className="app-dialog sync-dialog"><DialogHeader><DialogTitle>기기 간 동기화</DialogTitle><DialogDescription>기록은 이 기기의 localStorage에 먼저 저장되고, 로그인하면 Supabase에도 안전하게 복사됩니다.</DialogDescription></DialogHeader>
       {!isSupabaseConfigured ? <div className="sync-info warning"><CloudOff size={18} /><div><strong>Supabase 연결 정보가 아직 없어요.</strong><p>프로젝트 URL과 공개용 키를 연결하면 동기화를 사용할 수 있어요.</p></div></div> : session ? <div className="sync-account"><div className="sync-info"><Cloud size={18} /><div><strong>{syncLabel}</strong><p>{session.user.email}</p></div></div><p className="sync-help">휴대폰과 PC에서 같은 Google 계정으로 로그인하면 같은 업무 기록이 표시됩니다.</p><DialogFooter><button className="button-secondary signout-button" onClick={() => void signOut()}><LogOut size={14} /> 로그아웃</button><button className="button-primary sync-now-button" onClick={syncNow} disabled={syncStatus === 'syncing'}><RefreshCw size={14} /> 지금 동기화</button></DialogFooter></div> : <div className="sync-login"><button className="google-login-button" onClick={() => void signInWithGoogle()} disabled={authBusy}><span className="google-mark" aria-hidden="true">G</span>{authBusy ? 'Google 연결 중…' : 'Google로 로그인'}</button><p>휴대폰과 PC에서 같은 Google 계정을 선택하세요. 한 번 연결하면 로그인 메일을 다시 받을 필요가 없어요.</p>{authMessage && <output className="auth-message">{authMessage}</output>}<details className="email-fallback"><summary>이메일 링크로 로그인</summary><div className="email-fallback-fields"><label htmlFor="sync-email">로그인 이메일</label><input id="sync-email" className="dialog-input" type="email" inputMode="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && resendSeconds === 0 && void sendMagicLink()} placeholder="name@example.com" /><p>Google 로그인을 사용할 수 없을 때만 이용하세요.</p><button className="button-secondary email-login-button" onClick={() => void sendMagicLink()} disabled={!email.trim() || authBusy || resendSeconds > 0}>{authBusy ? '보내는 중…' : resendSeconds > 0 ? `${resendSeconds}초 후 다시 가능` : '로그인 링크 보내기'}</button></div></details><DialogFooter><button className="button-secondary" onClick={() => setSyncDialogOpen(false)}>나중에</button></DialogFooter></div>}
@@ -511,6 +579,34 @@ ${rawCopy(date, memos)}`;
     <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}><AlertDialogContent className="app-alert"><AlertDialogHeader><AlertDialogTitle>{deleteTarget?.label}을 삭제할까요?</AlertDialogTitle><AlertDialogDescription>{deleteTarget?.type === 'project' ? '프로젝트에 속한 기록과 AI 정리도 함께 삭제되며 되돌릴 수 없어요.' : '삭제한 내용은 되돌릴 수 없어요.'}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>취소</AlertDialogCancel><AlertDialogAction className="delete-button" onClick={confirmDelete}>삭제</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
     {toast && <div className="toast" role="status"><Check size={15} /> {toast}</div>}
   </main>;
+}
+
+function HomeDashboard({ projects, incompleteTasks, completedCount, todayCount, projectTodoCounts, onOpenTodos, onOpenToday, onToggle }: { projects: Project[]; incompleteTasks: TaskViewItem[]; completedCount: number; todayCount: number; projectTodoCounts: Map<string, number>; onOpenTodos: (projectId?: string) => void; onOpenToday: () => void; onToggle: (summaryId: string, todoId: string, completed: boolean) => void }) {
+  const activeProjects = projects.map((project) => ({ project, count: projectTodoCounts.get(project.id) ?? 0 })).filter((item) => item.count > 0).sort((a, b) => b.count - a.count);
+  const maxCount = Math.max(1, ...activeProjects.map((item) => item.count));
+  const nextTasks = [...incompleteTasks].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 5);
+  return <section className="dashboard-view">
+    <header className="page-heading"><div><span className="eyebrow">오늘의 업무</span><h1>안녕하세요.</h1><p>현재 미완료 업무가 <strong>{incompleteTasks.length}건</strong> 있어요.</p></div><button className="heading-action" onClick={() => onOpenTodos()}>전체 업무 보기 <ChevronRight size={16} /></button></header>
+    <div className="status-cards">
+      <button onClick={() => onOpenTodos()}><span>전체 미완료</span><strong>{incompleteTasks.length}</strong><small>바로 확인하기</small></button>
+      <button onClick={onOpenToday}><span>오늘 등록됨</span><strong>{todayCount}</strong><small>오늘 할 일</small></button>
+      <div><span>완료한 업무</span><strong>{completedCount}</strong><small>누적 완료</small></div>
+    </div>
+    <section className="dashboard-section"><div className="section-heading"><div><h2>프로젝트별 미완료</h2><p>숫자를 누르면 해당 업무만 모아볼 수 있어요.</p></div></div>
+      {activeProjects.length > 0 ? <div className="project-workload">{activeProjects.map(({ project, count }) => <button key={project.id} onClick={() => onOpenTodos(project.id)}><span className="workload-name">{project.name}</span><span className="workload-track"><i style={{ width: `${Math.max(10, (count / maxCount) * 100)}%` }} /></span><strong>{count}</strong><ChevronRight size={17} /></button>)}</div> : <div className="dashboard-empty"><CheckCircle2 size={23} /><strong>남은 업무가 없어요.</strong><span>새 업무가 생기면 프로젝트 정리에 추가해보세요.</span></div>}
+    </section>
+    {nextTasks.length > 0 && <section className="dashboard-section"><div className="section-heading"><div><h2>바로 확인할 업무</h2><p>최근 등록된 업무부터 보여드려요.</p></div><button onClick={() => onOpenTodos()}>전체보기 <ChevronRight size={15} /></button></div><div className="dashboard-task-list">{nextTasks.map((task) => <label key={`${task.summaryId}:${task.id}`}><Checkbox checked={false} onCheckedChange={(checked) => onToggle(task.summaryId, task.id, checked === true)} /><span><strong>{task.text}</strong><small>{task.projectName}</small></span><time>{shortDate(task.date)}</time></label>)}</div></section>}
+  </section>;
+}
+
+function GlobalTodoView({ total, groups, visibleCount, projectFilterName, scope, sort, search, collapsedProjects, onScopeChange, onSortChange, onSearchChange, onClearProjectFilter, onToggleProject, onToggle }: { total: number; groups: { project: Project; tasks: TaskViewItem[] }[]; visibleCount: number; projectFilterName?: string; scope: 'all' | 'today'; sort: 'recent' | 'oldest'; search: string; collapsedProjects: Set<string>; onScopeChange: (scope: 'all' | 'today') => void; onSortChange: () => void; onSearchChange: (value: string) => void; onClearProjectFilter: () => void; onToggleProject: (projectId: string) => void; onToggle: (summaryId: string, todoId: string, completed: boolean) => void }) {
+  return <section className="global-todos-view">
+    <header className="page-heading"><div><span className="eyebrow">모든 프로젝트</span><h1>미완료 업무</h1><p>해야 할 일을 한곳에서 확인하고 바로 완료하세요.</p></div><strong className="total-count">총 {total}건</strong></header>
+    <div className="todo-toolbar"><div className="scope-buttons"><button className={scope === 'all' ? 'active' : ''} onClick={() => onScopeChange('all')}>전체</button><button className={scope === 'today' ? 'active' : ''} onClick={() => onScopeChange('today')}>오늘 등록</button><button onClick={onSortChange}><ArrowDownUp size={14} /> {sort === 'recent' ? '최근순' : '오래된순'}</button></div><label className="todo-search"><Search size={16} /><input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="업무 검색" aria-label="미완료 업무 검색" /></label></div>
+    {projectFilterName && <div className="active-filter"><span>{projectFilterName}</span><button onClick={onClearProjectFilter}>전체 프로젝트 보기</button></div>}
+    <div className="global-todo-summary">표시 중 <strong>{visibleCount}건</strong></div>
+    {groups.length > 0 ? <div className="todo-project-groups">{groups.map(({ project, tasks }) => { const collapsed = collapsedProjects.has(project.id); return <section key={project.id} className="todo-project-group"><button className="todo-project-heading" onClick={() => onToggleProject(project.id)} aria-expanded={!collapsed}><span>{collapsed ? <ChevronRight size={18} /> : <ChevronDown size={18} />}<strong>{project.name}</strong></span><b>{tasks.length}</b></button>{!collapsed && <div className="global-task-list">{tasks.map((task) => <label key={`${task.summaryId}:${task.id}`}><Checkbox checked={false} onCheckedChange={(checked) => onToggle(task.summaryId, task.id, checked === true)} /><span>{task.text}</span><time>{shortDate(task.date)}</time></label>)}</div>}</section>; })}</div> : <div className="dashboard-empty todo-empty"><CheckCircle2 size={24} /><strong>{total === 0 ? '모든 업무를 완료했어요.' : '조건에 맞는 업무가 없어요.'}</strong><span>{total === 0 ? '새 할 일이 생기면 이곳에 자동으로 모입니다.' : '검색어나 필터를 바꿔보세요.'}</span></div>}
+  </section>;
 }
 
 function SummarySection({ title, children }: { title: string; children: React.ReactNode }) { return <section className="summary-section"><h3>{title}</h3>{children}</section>; }
